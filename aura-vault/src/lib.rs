@@ -113,7 +113,7 @@ use storage::{
 };
 use governance::{
     initialize_governance, create_proposal, vote_on_proposal, execute_proposal,
-    get_proposal_status, ProposalStatus, ProposalType,
+    expire_operation, get_proposal_status, ProposalStatus, ProposalType,
 };
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +1065,16 @@ impl AuraVault {
                 (Symbol::new(&env, "harvest"), caller.clone(), yield_amount),
                 (yield_after_fee, fee_amount, new_total),
             );
+            if fee_amount > 0 {
+                let recipient = storage::get_treasury(&env)
+                    .or_else(|| get_admin(&env));
+                if let Some(recipient) = recipient {
+                    env.events().publish(
+                        (Symbol::new(&env, "fee_collected"),),
+                        (recipient, fee_amount, perf_fee_bps),
+                    );
+                }
+            }
 
             bump_instance(&env);
 
@@ -1870,6 +1880,7 @@ impl AuraVault {
                 return Err(VaultError::UpgradeUnauthorized);
             }
             admin.require_auth();
+            fee::validate_fees(perf_fee_bps, mgmt_fee_bps)?;
             storage::set_perf_fee_bps(&env, perf_fee_bps);
             storage::set_mgmt_fee_bps(&env, mgmt_fee_bps);
             bump_instance(&env);
@@ -1976,6 +1987,9 @@ impl AuraVault {
     /// Set or update the TVL cap. `cap = 0` disables the cap (unlimited deposits).
     pub fn set_tvl_cap(env: Env, admin: Address, cap: i128) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
+            if cap < 0 {
+                return Err(VaultError::InvalidAddress);
+            }
             let stored_admin = get_admin(&env).ok_or(VaultError::NotInitialized)?;
             if stored_admin != admin {
                 return Err(VaultError::UpgradeUnauthorized);
@@ -2285,6 +2299,18 @@ impl AuraVault {
                 ProposalStatus::Executed => soroban_sdk::String::from_str(&env, "Executed"),
                 ProposalStatus::Expired => soroban_sdk::String::from_str(&env, "Rejected"),
             }
+        })
+    }
+
+    /// Persist the expired state and emit `proposal_expired` after the expiry deadline.
+    /// This cleanup call is permissionless and returns false if no transition was needed.
+    pub fn expire_proposal(env: Env, proposal_id: u64) -> Result<bool, VaultError> {
+        with_reentrancy_guard(&env, || {
+            let expired = expire_operation(&env, proposal_id)?;
+            if expired {
+                bump_instance(&env);
+            }
+            Ok(expired)
         })
     }
 

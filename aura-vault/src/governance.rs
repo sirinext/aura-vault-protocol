@@ -124,11 +124,7 @@ fn set_op(env: &Env, id: u64, op: &MultiSigOp) {
 ///
 /// # Events
 /// Emits `OperationProposed` with topics `(op_id, proposer)`.
-pub fn propose_operation(
-    env: &Env,
-    proposer: Address,
-    op_type: OpType,
-) -> Result<u64, VaultError> {
+pub fn propose_operation(env: &Env, proposer: Address, op_type: OpType) -> Result<u64, VaultError> {
     proposer.require_auth();
 
     // Proposer must be a registered signer
@@ -173,6 +169,16 @@ pub fn propose_operation(
         (Symbol::new(env, "OperationProposed"), new_id, proposer),
         (),
     );
+    env.events().publish(
+        (Symbol::new(env, "proposal_created"), new_id),
+        (op.proposer.clone(), op.expires_at),
+    );
+    if matches!(op.status, OpStatus::Ready) {
+        env.events().publish(
+            (Symbol::new(env, "timelock_started"), new_id),
+            (now, op.expires_at),
+        );
+    }
 
     Ok(new_id)
 }
@@ -182,11 +188,7 @@ pub fn propose_operation(
 /// # Events
 /// Emits `OperationSigned` with topics `(op_id, signer, sig_count)`.
 /// If the threshold is reached, also transitions the status to `Ready`.
-pub fn sign_operation(
-    env: &Env,
-    signer: Address,
-    op_id: u64,
-) -> Result<(), VaultError> {
+pub fn sign_operation(env: &Env, signer: Address, op_id: u64) -> Result<(), VaultError> {
     signer.require_auth();
 
     // Must be a registered signer
@@ -205,7 +207,7 @@ pub fn sign_operation(
 
     match op.status {
         OpStatus::Executed => return Err(VaultError::OperationAlreadyExecuted),
-        OpStatus::Expired  => return Err(VaultError::OperationExpired),
+        OpStatus::Expired => return Err(VaultError::OperationExpired),
         _ => {}
     }
 
@@ -226,9 +228,17 @@ pub fn sign_operation(
     set_op(env, op_id, &op);
 
     env.events().publish(
-        (Symbol::new(env, "OperationSigned"), op_id, signer),
+        (Symbol::new(env, "OperationSigned"), op_id, signer.clone()),
         sig_count,
     );
+    env.events()
+        .publish((Symbol::new(env, "vote_cast"), op_id), (signer, sig_count));
+    if matches!(op.status, OpStatus::Ready) && sig_count == threshold {
+        env.events().publish(
+            (Symbol::new(env, "timelock_started"), op_id),
+            (now, op.expires_at),
+        );
+    }
 
     Ok(())
 }
@@ -265,18 +275,18 @@ pub fn execute_multisig_op(
 
     match op.status {
         OpStatus::Executed => return Err(VaultError::OperationAlreadyExecuted),
-        OpStatus::Expired  => return Err(VaultError::OperationExpired),
-        OpStatus::Pending  => return Err(VaultError::ThresholdNotMet),
-        OpStatus::Ready    => {}
+        OpStatus::Expired => return Err(VaultError::OperationExpired),
+        OpStatus::Pending => return Err(VaultError::ThresholdNotMet),
+        OpStatus::Ready => {}
     }
 
     op.status = OpStatus::Executed;
     set_op(env, op_id, &op);
 
-    env.events().publish(
-        (Symbol::new(env, "OperationExecuted"), op_id, executor),
-        (),
-    );
+    env.events()
+        .publish((Symbol::new(env, "OperationExecuted"), op_id, executor), ());
+    env.events()
+        .publish((Symbol::new(env, "proposal_executed"), op_id), now);
 
     Ok(op)
 }
@@ -284,7 +294,6 @@ pub fn execute_multisig_op(
 /// Read the current status of a multi-sig operation.
 pub fn get_operation_status(env: &Env, op_id: u64) -> Option<OpStatus> {
     get_op(env, op_id).map(|op| {
-        // Lazily reflect expiry without writing state (read-only)
         let now = env.ledger().timestamp();
         if matches!(op.status, OpStatus::Pending | OpStatus::Ready) && now > op.expires_at {
             OpStatus::Expired
@@ -292,6 +301,23 @@ pub fn get_operation_status(env: &Env, op_id: u64) -> Option<OpStatus> {
             op.status
         }
     })
+}
+
+/// Persist an expired proposal transition and emit its lifecycle event.
+/// Anyone may call this permissionless cleanup entrypoint after expiry.
+pub fn expire_operation(env: &Env, op_id: u64) -> Result<bool, VaultError> {
+    let mut op = get_op(env, op_id).ok_or(VaultError::OperationNotFound)?;
+    if matches!(op.status, OpStatus::Expired | OpStatus::Executed) {
+        return Ok(false);
+    }
+    if env.ledger().timestamp() <= op.expires_at {
+        return Ok(false);
+    }
+    op.status = OpStatus::Expired;
+    set_op(env, op_id, &op);
+    env.events()
+        .publish((Symbol::new(env, "proposal_expired"), op_id), op.expires_at);
+    Ok(true)
 }
 
 /// Return the full operation record.
@@ -364,7 +390,13 @@ pub fn initialize_governance(env: &Env, signers: Vec<Address>) -> Result<(), Vau
 
     // Default threshold is 2; clamp to signer count if fewer than 2 signers provided
     let len = signers.len() as u32;
-    let threshold = if len == 0 { 1 } else if len < 2 { len } else { 2 };
+    let threshold = if len == 0 {
+        1
+    } else if len < 2 {
+        len
+    } else {
+        2
+    };
     set_multisig_threshold(env, threshold);
 
     Ok(())
@@ -400,11 +432,7 @@ pub fn vote_on_proposal(
     sign_operation(env, voter, proposal_id)
 }
 
-pub fn execute_proposal(
-    env: &Env,
-    executor: Address,
-    proposal_id: u64,
-) -> Result<(), VaultError> {
+pub fn execute_proposal(env: &Env, executor: Address, proposal_id: u64) -> Result<(), VaultError> {
     execute_multisig_op(env, executor, proposal_id)?;
     Ok(())
 }

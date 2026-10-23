@@ -49,17 +49,24 @@ import { errorHandler } from "./middleware/errorMiddleware.js";
 import { runCacheWarmup, getWarmupStatus } from "./services/cacheWarmup.js";
 import { startEmailWorker, stopEmailWorker } from "./services/emailQueue.js";
 import {
+  startDigestScheduler,
+  stopDigestScheduler,
+} from "./services/digestScheduler.js";
+import { openApiValidationMiddleware } from "./middleware/requestValidationMiddleware.js";
+import {
   startUserExportWorker,
   stopUserExportWorker,
 } from "./services/userExportService.js";
 import { startYieldWorker, stopYieldWorker } from "./services/yieldWorker.js";
 import { startHarvestRepeatableJob, stopHarvestRepeatableJob } from "./services/harvestRepeatableJob.js";
 import { startAlertEvaluationJob, stopAlertEvaluationJob } from "./services/alertEvaluationJob.js";
+import { startSharePriceAlertWorker, stopSharePriceAlertWorker } from "./services/sharePriceAlertWorker.js";
 import { vaultRouter } from "./routes/vaultRoutes.js";
 import { vaultTransactionRouter } from "./routes/vaultTransactionRoutes.js";
 import { vaultRegistryRouter } from "./routes/vaultRegistryRoutes.js";
 import { startVaultSyncJob, stopVaultSyncJob } from "./services/vaultRegistryService.js";
 import { vaultSubmitRouter } from "./routes/vaultSubmitRoutes.js";
+import { balanceOfRouter } from "./routes/balanceOfRoutes.js";
 import { userPreferencesRouter } from "./routes/userPreferencesRoutes.js";
 import { leaderboardRouter } from "./routes/leaderboardRoutes.js";
 import { referralRouter } from "./routes/referralRoutes.js";
@@ -67,6 +74,10 @@ import { userExportRouter } from "./routes/userExportRoutes.js";
 import { indexerRouter } from "./routes/indexerRoutes.js";
 import { portfolioHistoryRouter } from "./routes/portfolioHistoryRoutes.js";
 import { swaggerRouter } from "./routes/swaggerRoutes.js";
+// Issue #1268: Governance proposals API
+import { governanceRouter } from "./routes/governanceRoutes.js";
+// Issue #1271: SSE vault events endpoint
+import { vaultEventsRouter } from "./routes/vaultEventsRoutes.js";
 // Issue #263: Admin panel — router + middleware
 import { adminRouter } from "./routes/adminRoutes.js";
 import { authenticateAdmin } from "./middleware/adminMiddleware.js";
@@ -98,6 +109,10 @@ import {
   getRedisCircuitBreakerStats,
 } from "./services/redisCircuitBreakerService.js";
 import { metricsRouter, metricsMiddleware } from "./metrics.js";
+// Issue #1272: response compression
+import { compressionMiddleware } from "./middleware/compressionMiddleware.js";
+// Issue #1269: safe startup log — import only non-sensitive config sections
+import { serverConfig, redisConfig, databaseConfig } from "./config/index.js";
 
 const app = express();
 
@@ -119,7 +134,14 @@ app.use(loggingMiddleware());
 app.use(metricsMiddleware());
 
 app.use(express.json({ limit: "1mb" }));
+// Issue #1272: compress responses before they leave the server
+app.use(compressionMiddleware);
 app.use(responseEnvelopeMiddleware);
+
+// ── Issue #945: OpenAPI request validation (disabled in test env) ────────────
+if (process.env.NODE_ENV !== "test") {
+  app.use(openApiValidationMiddleware());
+}
 
 // Global IP rate limiter — health check and metrics excluded so load-balancer probes and scrapers are not throttled
 app.use(globalIpRateLimiter(["/api/health", "/metrics"]));
@@ -214,12 +236,20 @@ app.use("/api/v1/vaults", vaultRegistryRouter);
 
 // Vault transaction submit — lightweight UI modal endpoint
 app.use("/api/vault/transactions", vaultSubmitRouter);
+// Public read-only account share lookup used by portfolio analysis.
+app.use("/api/vault", balanceOfRouter);
 
 // Referral tracking — public routes (register, stats, deposit webhook)
 app.use("/api/referrals", referralRouter);
 
 // Issue #868: OpenAPI 3.1 Spec and Swagger UI at /api/docs
 app.use("/api/docs", swaggerRouter);
+
+// Issue #1268: Governance proposals API
+app.use("/api/v1/governance", governanceRouter);
+
+// Issue #1271: SSE vault events endpoint
+app.use("/api/v1/vault", vaultEventsRouter);
 
 // ── Issue #285: Contract event stream (SSE) ───────────────────────────────────
 app.use("/api/v1/events", eventsRouter);
@@ -291,11 +321,13 @@ const server = app.listen(PORT, () => {
   void autoMigrate();         // issue #293: run pending SQL migrations on startup
   startWorker();
   startEmailWorker();
+  startDigestScheduler();     // issue #935: weekly portfolio digest cron job
   startUserExportWorker();
   startYieldWorker();
   startVaultSyncJob();        // issue #942: background TVL/APY sync for vault registry
   void startHarvestRepeatableJob(); // issue #944: BullMQ repeatable harvest cron job
   void startAlertEvaluationJob();  // issue #946: alert threshold evaluation every 5 min
+  startSharePriceAlertWorker();    // issue #908: hourly share price alert evaluation
   startAnalyticsCacheWarmer();
   void warmCache();           // existing DeFi price warm-up
   void runCacheWarmup();      // issue #325: vault stats / share price / top depositors
@@ -310,15 +342,24 @@ const server = app.listen(PORT, () => {
     logger.warn({ err }, "[startup] BullMQ init failed — vault queue unavailable");
   }
 
-  logger.info({ port: PORT }, `Aura Vault backend running on port ${PORT}`);
+  // Issue #1269: emit a safe startup log — no secrets, passwords, or full connection URLs.
+  // Extract only the hostname portion from connection strings so credentials never appear in logs.
+  const redisHost = (() => { try { return new URL(redisConfig.url).hostname; } catch { return "unknown"; } })();
+  const dbHost   = (() => { try { return new URL(databaseConfig.url).hostname; } catch { return "unknown"; } })();
+  logger.info(
+    { port: PORT, nodeEnv: serverConfig.nodeEnv, redisHost, dbHost },
+    `Aura Vault backend running on port ${PORT}`,
+  );
 });
 
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, `[shutdown] received ${signal}`);
   stopWorker();
   stopEmailWorker();
+  stopDigestScheduler();      // issue #935
   stopUserExportWorker();
   stopYieldWorker();
+  stopSharePriceAlertWorker(); // issue #908
   stopVaultSyncJob();         // issue #942
   await stopHarvestRepeatableJob(); // issue #944
   await stopAlertEvaluationJob();  // issue #946

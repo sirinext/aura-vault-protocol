@@ -32,11 +32,11 @@ pub fn calc_mgmt_fee_daily(total_assets: i128, mgmt_fee_bps: u32) -> Result<i128
 
 /// Validate fee percentages
 pub fn validate_fees(perf_fee_bps: u32, mgmt_fee_bps: u32) -> Result<(), VaultError> {
-    if !(MIN_PERF_FEE_BPS..=MAX_PERF_FEE_BPS).contains(&perf_fee_bps) {
-        return Err(VaultError::InvalidAddress); // Reuse for invalid fee
+    if perf_fee_bps < MIN_PERF_FEE_BPS || perf_fee_bps > MAX_PERF_FEE_BPS {
+        return Err(VaultError::InvalidFee);
     }
-    if !(MIN_MGMT_FEE_BPS..=MAX_MGMT_FEE_BPS).contains(&mgmt_fee_bps) {
-        return Err(VaultError::InvalidAddress);
+    if mgmt_fee_bps < MIN_MGMT_FEE_BPS || mgmt_fee_bps > MAX_MGMT_FEE_BPS {
+        return Err(VaultError::InvalidFee);
     }
     Ok(())
 }

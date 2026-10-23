@@ -1,5 +1,7 @@
 # Getting Started with Aura Vault
 
+For local setup failures, see the [troubleshooting guide](troubleshooting.md).
+
 Aura Vault is a yield-generating vault on the Stellar network. You deposit tokens, receive vault shares, and your shares automatically grow in value as the vault earns yield — no manual compounding required.
 
 > **New to crypto?** Start with [Step 1](#step-1--install-a-wallet). If you already have Freighter installed and funded, jump to [Step 2](#step-2--connect-your-wallet).

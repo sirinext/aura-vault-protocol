@@ -11,6 +11,7 @@ This document provides everything an external auditor needs to scope, understand
 - [Known Issues and Accepted Risks](#known-issues-and-accepted-risks)
 - [Test Coverage Report](#test-coverage-report)
 - [Fuzz Testing Summary](#fuzz-testing-summary)
+- [Formal Verification](#formal-verification)
 - [Previous Audit Findings and Remediations](#previous-audit-findings-and-remediations)
 - [Security Properties Verified](#security-properties-verified)
 - [Build and Run Instructions](#build-and-run-instructions)
@@ -225,6 +226,44 @@ To reproduce:
 ```bash
 cd aura-vault
 cargo test prop_   # runs all proptest properties
+```
+
+---
+
+## Formal Verification
+
+**Tool:** Kani Rust Verifier 0.68.0. The proof crate in
+`aura-vault/verification/` imports the pure share arithmetic and share-supply
+transition functions used by the contract. The CI workflow
+`.github/workflows/kani-verification.yml` runs the proofs with a 10-minute
+budget when the contract math, proof crate, or workflow changes.
+
+The harnesses quantify over valid non-negative `i128` values. Operations that
+would overflow are represented by checked failures; the proofs assert the
+invariants for successful arithmetic paths. Share conservation is demonstrated
+with two holders, which captures each owner's update without requiring an
+unbounded list of addresses.
+
+| Invariant | Kani harness | Formal claim |
+|---|---|---|
+| Positive deposits do not mint zero shares | `successful_deposit_never_mints_zero_shares_for_i128_inputs` | Every successful positive deposit produces at least one share. |
+| Harvest is non-dilutive | `harvest_does_not_reduce_share_price_for_i128_inputs` | With unchanged positive supply, adding non-negative assets preserves or increases the exact assets-per-share ratio; flooring that ratio to fixed-point precision preserves monotonicity. |
+| Redemption is bounded | `withdrawal_redemption_is_bounded_by_deposit_plus_accrued_yield` | Pro-rata redemption is no greater than aggregate deposited assets plus accrued yield. |
+| Share-sum conservation | `deposit_transition_preserves_two_holder_share_sum_for_i128_inputs` and `withdraw_transition_preserves_two_holder_share_sum_for_i128_inputs` | Deposit and withdrawal update owner balance and total supply by the same share amount. |
+
+**Current result:** Kani 0.68.0 completed locally: **5 harnesses passed, 0
+failed**, in under one minute total. The harvest proof compares asset totals
+with unchanged positive supply, avoiding unnecessary division while proving
+the exact ratio and its rounded fixed-point representation are non-decreasing.
+CI repeats the proofs on changes to the contract math, proof crate, or workflow.
+These harnesses check the pure share arithmetic and transitions, not the full
+Soroban runtime or token calls.
+
+Run locally after installing Kani:
+
+```bash
+cd aura-vault/verification
+cargo kani
 ```
 
 ---

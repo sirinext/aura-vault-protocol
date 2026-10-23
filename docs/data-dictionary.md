@@ -1,6 +1,6 @@
 # Aura Vault — PostgreSQL Data Dictionary
 
-This document describes every table, column, index, constraint, trigger, and function in the Aura Vault PostgreSQL schema. It is generated from `backend/migrations/` and maintained alongside the migration files.
+This document describes the requested application data entities. Implemented structures below are checked against `backend/migrations/`; entities marked **planned** do not have a migration yet and their column lists are a proposed design, not deployed schema.
 
 ---
 
@@ -281,3 +281,245 @@ The following columns and tables are anticipated in upcoming migrations based on
 - **Zero downtime index creation:** Always use `CREATE INDEX CONCURRENTLY` in production migrations to avoid table locks.
 - **Backfilling `changed_by`:** To retroactively populate `changed_by` in the audit log, use `SET LOCAL app.current_user_id` in a transaction before DML and update the trigger function to read it via `current_setting('app.current_user_id', true)`.
 - **Archival strategy:** Rows in `vault_position_audit_log` accumulate indefinitely. For deployments older than 12 months, consider partitioning `vault_position_audit_log` by `changed_at` year/month and archiving cold partitions to cold storage (e.g., AWS S3 via `pg_partman`).
+
+---
+
+## Application Data Dictionary (Requested Entities)
+
+The issue names `transaction_queue` and `webhook_subscriptions`; the current migrations call these `transaction_jobs` and `webhooks`. Those aliases are documented together below. `apy_snapshots`, `user_preferences`, and `governance_proposals` are **planned** and have no current migration; their entries specify the proposed contract so a future migration can be reviewed against it. There is no claim that planned tables exist in deployed databases.
+
+### Entity map
+
+| Requested entity | Current PostgreSQL name | Status / migration |
+|---|---|---|
+| `vault_positions` | `vault_positions` | Implemented, `001_create_vault_positions.sql` |
+| `transaction_queue` | `transaction_jobs` | Implemented, `002_create_transaction_jobs.sql` |
+| `yield_calculations` | `yield_calculations` | Implemented, `004_create_yield_calculations.sql` |
+| `contract_events` | `contract_events` | Implemented, `005_create_contract_events.sql` |
+| `apy_snapshots` | — | Planned; no migration |
+| `user_preferences` | — | Planned; no migration |
+| `audit_logs` | `audit_logs` | Implemented, `009_create_audit_logs.sql` |
+| `webhook_subscriptions` | `webhooks` | Implemented as `webhooks`, `013_create_webhooks.sql` |
+| `governance_proposals` | — | Planned; no migration |
+
+### Implemented tables
+
+Columns in this section are the migration definitions. “No” in the Nullable column means `NOT NULL`; “Yes” means nullable. Primary keys are also non-null.
+
+#### `vault_positions`
+
+See the full column, constraint, trigger, and index reference above. It stores a user's position per vault. `user_id` and `vault_id` are application identifiers and do not have PostgreSQL foreign keys in the current migration.
+
+#### `transaction_queue` (`transaction_jobs`)
+
+Queue records for asynchronous deposit, withdrawal, and claim processing (`002_create_transaction_jobs.sql`). Amounts are text because the queue payload preserves token precision; parse and validate them at the application boundary.
+
+| Column | Type | Nullable | Default / constraint | Purpose and example |
+|---|---|---:|---|---|
+| `id` | TEXT | No | Primary key | Queue/job identifier, e.g. `job_abc`. |
+| `tx_type` | TEXT | No | CHECK: deposit, withdrawal, claim | Requested operation, e.g. `deposit`. |
+| `wallet_address` | TEXT | No | — | Stellar wallet address, e.g. `G...`. |
+| `amount` | TEXT | No | — | Decimal token amount, e.g. `12.5000000`. |
+| `webhook_url` | TEXT | Yes | NULL | Optional callback destination. |
+| `status` | TEXT | No | `waiting`; CHECK: waiting, active, completed, failed, dead | Worker lifecycle state. |
+| `attempts` | INTEGER | No | `0` | Number of processing attempts. |
+| `result` | TEXT | Yes | NULL | Successful result or transaction reference. |
+| `error` | TEXT | Yes | NULL | Most recent failure description. |
+| `meta` | JSONB | Yes | NULL | Optional structured job context. |
+| `created_at` | TIMESTAMPTZ | No | `NOW()` | Enqueue time. |
+| `updated_at` | TIMESTAMPTZ | No | `NOW()`; update trigger | Last update; maintained by `trg_tx_jobs_updated_at`. |
+
+Foreign keys: none. Indexes: `idx_tx_jobs_status(status)` supports worker polling by state; `idx_tx_jobs_wallet(wallet_address)` supports wallet history; `idx_tx_jobs_created(created_at DESC)` supports newest-first queue inspection. Example: `SELECT id, tx_type, amount FROM transaction_jobs WHERE status = 'waiting' ORDER BY created_at DESC;`
+
+#### `yield_calculations`
+
+Per-position yield calculation results (`004_create_yield_calculations.sql`). No database foreign key connects `position_id` to `vault_positions.id`; the former is TEXT while the latter is BIGINT.
+
+| Column | Type | Nullable | Default / constraint | Purpose and example |
+|---|---|---:|---|---|
+| `id` | BIGSERIAL | No | Primary key | Calculation row ID, e.g. 42. |
+| `position_id` | TEXT | No | — | Application position identifier. |
+| `calc_date` | TIMESTAMPTZ | No | — | Calculation time/window anchor. |
+| `daily_yield` | NUMERIC(38,18) | No | CHECK >= 0 | Yield for the calculation period. |
+| `total_yield` | NUMERIC(38,18) | No | CHECK >= 0 | Accumulated yield recorded for the position. |
+| `effective_apy` | NUMERIC(10,8) | No | CHECK >= 0 | Annualized yield estimate, e.g. 0.12500000. |
+| `sources_detail` | JSONB | No | `[]` | Structured breakdown by yield source. |
+| `created_at` | TIMESTAMPTZ | No | `NOW()` | Insert time. |
+
+Indexes: `idx_yield_calculations_position_id(position_id, calc_date DESC)` retrieves a position's latest calculations; `idx_yield_calculations_calc_date(calc_date DESC)` supports recent-period scans. Example: `SELECT calc_date, total_yield, effective_apy FROM yield_calculations WHERE position_id = $1 ORDER BY calc_date DESC LIMIT 1;`
+
+#### `contract_events`
+
+Indexed event records ingested from Soroban contracts (`005_create_contract_events.sql`).
+
+| Column | Type | Nullable | Default / constraint | Purpose and example |
+|---|---|---:|---|---|
+| `id` | BIGSERIAL | No | Primary key | Local event row ID. |
+| `ledger_sequence` | BIGINT | No | — | Ledger containing the event. |
+| `transaction_hash` | TEXT | No | Unique with event_index | Stellar transaction hash. |
+| `event_index` | TEXT | No | Unique with transaction_hash | Event position within a transaction. |
+| `contract_id` | TEXT | No | — | Emitting Soroban contract. |
+| `event_type` | TEXT | No | — | Event name/type, e.g. `deposit`. |
+| `topic` | JSONB | No | `[]` | Serialized event topics. |
+| `value` | JSONB | No | `{}` | Serialized event payload. |
+| `created_at` | TIMESTAMPTZ | No | `NOW()` | Database ingestion time. |
+
+Foreign keys: none. Constraint `contract_events_transaction_hash_event_index_key` prevents duplicate event positions. Index `idx_contract_events_created_at(created_at DESC)` supports newest-first event feeds. Example: `SELECT ledger_sequence, event_type, value FROM contract_events WHERE contract_id = $1 ORDER BY created_at DESC LIMIT 100;`
+
+#### `audit_logs`
+
+Append-oriented application audit events (`009_create_audit_logs.sql`). Actor and entity identifiers are text to support wallet addresses, service identities, and heterogeneous resource IDs.
+
+| Column | Type | Nullable | Default / constraint | Purpose and example |
+|---|---|---:|---|---|
+| `id` | BIGSERIAL | No | Primary key | Audit row ID. |
+| `actor` | TEXT | No | — | Actor identity, e.g. wallet or service name. |
+| `entity_type` | TEXT | No | — | Resource class, e.g. `vault`. |
+| `entity_id` | TEXT | No | — | Specific resource identifier. |
+| `action` | TEXT | No | — | Operation, e.g. `deposit`. |
+| `metadata` | JSONB | No | `{}` | Structured event details. |
+| `anchor_hash` | TEXT | Yes | NULL | Tamper-evidence chain hash; NULL until anchored. |
+| `created_at` | TIMESTAMPTZ | No | `NOW()` | Event time in the database. |
+
+Foreign keys: none. Indexes: `idx_audit_logs_unanchored(created_at ASC) WHERE anchor_hash IS NULL` supports the anchoring worker; `idx_audit_logs_created_at(created_at ASC)` supports time ranges; `idx_audit_logs_actor_created(actor, created_at DESC)`, `idx_audit_logs_entity_type_created(entity_type, created_at DESC)`, and `idx_audit_logs_entity_id_created(entity_id, created_at DESC)` support filtered histories; `idx_audit_logs_actor_entity(actor, entity_type, entity_id, created_at DESC)` supports the combined filter. Example: `SELECT id, action, metadata FROM audit_logs WHERE actor = $1 ORDER BY created_at DESC LIMIT 50;`
+
+#### `webhook_subscriptions` (`webhooks`)
+
+The implemented subscription registry is named `webhooks` (`013_create_webhooks.sql`). Delivery history is stored separately in `webhook_deliveries`, which references `webhooks.id) with `ON DELETE CASCADE`.
+
+| Column | Type | Nullable | Default / constraint | Purpose and example |
+|---|---|---:|---|---|
+| `id` | UUID | No | `gen_random_uuid()`; primary key | Subscription identifier. |
+| `url` | TEXT | No | — | Destination URL. |
+| `secret` | TEXT | No | — | Secret used to authenticate signed deliveries; protect at rest. |
+| `event_types` | TEXT[] | No | `{}` | Subscribed event names. |
+| `consecutive_failures` | INTEGER | No | `0` | Consecutive failed delivery count. |
+| `created_at` | TIMESTAMPTZ | No | `NOW()` | Registration time. |
+| `updated_at` | TIMESTAMPTZ | No | `NOW()` | Last update time. |
+
+Foreign keys: none on `webhooks`; child table `webhook_deliveries.webhook_id → webhooks.id` cascades on delete. The migration defines no index on `webhooks`. The child indexes `idx_webhook_deliveries_webhook_id(webhook_id, created_at DESC)` and partial `idx_webhook_deliveries_pending(next_retry_at ASC) WHERE status = 'pending'` support delivery history and retry polling. Example: `SELECT id, url, event_types FROM webhooks WHERE $1 = ANY(event_types);`
+
+### Planned entities (not present in migrations)
+
+The following proposed schemas have no deployed columns, constraints, foreign keys, or indexes yet. They are included to make the requested future data model explicit; migration authors should update this section to match the final DDL.
+
+#### `apy_snapshots` — proposed
+
+| Column | Proposed type | Nullable | Default / purpose |
+|---|---|---:|---|
+| `id` | BIGSERIAL | No | Primary key. |
+| `vault_id` | UUID | No | Vault whose APY is measured. |
+| `window` | TEXT | No | Measurement window, e.g. `7d` or `30d`. |
+| `apy` | NUMERIC(10,8) | No | Annualized yield estimate. |
+| `sampled_at` | TIMESTAMPTZ | No | Snapshot time; default `NOW()`. |
+
+Proposed FK: none until vault IDs are represented by a relational vault registry. Proposed index: `(vault_id, window, sampled_at DESC)` for latest APY by vault/window.
+
+#### `user_preferences` — proposed
+
+| Column | Proposed type | Nullable | Default / purpose |
+|---|---|---:|---|
+| `user_id` | UUID | No | Primary key; application user identity. |
+| `locale` | TEXT | No | Caption/UI locale; default `en`. |
+| `theme` | TEXT | No | UI theme; default `system`. |
+| `notifications_enabled` | BOOLEAN | No | Notification preference; default TRUE. |
+| `updated_at` | TIMESTAMPTZ | No | Last change; default `NOW()`. |
+
+Proposed FK: none until a users table exists. The primary key supports direct lookup by user; no additional index proposed.
+
+#### `governance_proposals` — proposed
+
+| Column | Proposed type | Nullable | Default / purpose |
+|---|---|---:|---|
+| `id` | UUID | No | Primary key; proposal identifier. |
+| `proposer` | TEXT | No | Proposer wallet address. |
+| `proposal_type` | TEXT | No | Action category, e.g. `set_fee`. |
+| `payload` | JSONB | No | Validated action arguments. |
+| `status` | TEXT | No | Lifecycle state; proposed default `pending`. |
+| `created_at` | TIMESTAMPTZ | No | Creation time; default `NOW()`. |
+| `expires_at` | TIMESTAMPTZ | No | Voting/execution deadline. |
+| `executed_at` | TIMESTAMPTZ | Yes | NULL until executed. |
+
+Proposed FK: none. Proposed indexes: `(status, expires_at)` for active proposals and `(proposer, created_at DESC)` for a proposer's history.
+
+### ER diagram
+
+```mermaid
+erDiagram
+  VAULT_POSITIONS ||--o{ VAULT_POSITION_AUDIT_LOG : "position_id (logical reference; no FK)"
+  WEBHOOKS ||--o{ WEBHOOK_DELIVERIES : "id to webhook_id (ON DELETE CASCADE)"
+  VAULT_POSITIONS {
+    bigint id PK
+    uuid user_id
+    uuid vault_id
+    numeric amount
+    timestamptz created_at
+  }
+  TRANSACTION_JOBS {
+    text id PK
+    text wallet_address
+    text status
+  }
+  YIELD_CALCULATIONS {
+    bigint id PK
+    text position_id
+    timestamptz calc_date
+  }
+  CONTRACT_EVENTS {
+    bigint id PK
+    text transaction_hash
+    text event_index
+  }
+  APY_SNAPSHOTS {
+    bigint id PK
+    uuid vault_id
+    timestamptz sampled_at
+  }
+  USER_PREFERENCES {
+    uuid user_id PK
+  }
+  AUDIT_LOGS {
+    bigint id PK
+    text actor
+    timestamptz created_at
+  }
+  WEBHOOKS {
+    uuid id PK
+    text url
+  }
+  WEBHOOK_DELIVERIES {
+    uuid id PK
+    uuid webhook_id FK
+  }
+  GOVERNANCE_PROPOSALS {
+    uuid id PK
+    text proposer
+    text status
+  }
+```
+
+### Naming and type conventions
+
+- Table names are lowercase plural snake_case; columns are lowercase snake_case.
+- Use `BIGSERIAL` for local numeric row IDs, UUID for globally generated identifiers, and `TIMESTAMPTZ` for instants.
+- Use `NUMERIC` for token amounts and financial rates; do not use floating-point types for money.
+- Use JSONB for structured event or metadata payloads, not for values that require relational constraints or frequent filtering.
+- Foreign keys are added only where the migration defines them. Names that look related (such as `position_id`) are not automatically enforced relationships.
+- Planned entities above are design proposals; deployed schema is defined only by applied migrations.
+
+### Index lookup examples
+
+```sql
+-- Queue workers: status filter and newest jobs
+SELECT id FROM transaction_jobs WHERE status = 'waiting' ORDER BY created_at DESC;
+
+-- Latest calculation for one position
+SELECT * FROM yield_calculations WHERE position_id = $1 ORDER BY calc_date DESC LIMIT 1;
+
+-- Event feed for one contract
+SELECT * FROM contract_events WHERE contract_id = $1 ORDER BY created_at DESC LIMIT 100;
+
+-- Pending webhook retry candidates
+SELECT id FROM webhook_deliveries WHERE status = 'pending' AND next_retry_at <= NOW()
+ORDER BY next_retry_at;
+```
